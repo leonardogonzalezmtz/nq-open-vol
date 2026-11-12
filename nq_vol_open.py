@@ -115,7 +115,8 @@ def load_5m(src_dir: Path | None, extra_csv: Path | None, now: pd.Timestamp) -> 
     if extra_csv:
         frames.append(read_bars_csv(extra_csv))
     if src_dir:
-        frames.append(read_bars_csv(src_dir / "nq_5m.csv"))
+        f5 = src_dir / "nq_5m.csv"
+        frames.append(read_bars_csv(f5 if f5.exists() else src_dir / "nq_5m_cache.csv"))
     else:
         h = _yf().Ticker("NQ=F").history(period="60d", interval="5m", auto_adjust=False)
         if h.empty:
@@ -145,6 +146,10 @@ def load_daily(src_dir: Path | None) -> pd.DataFrame:
         if getattr(d.index, "tz", None) is not None:
             d.index = d.index.tz_localize(None)
         d.index = d.index.normalize()
+    if not src_dir:
+        DATA.mkdir(exist_ok=True)
+        nq.rename(columns=str.lower)[["open", "high", "low", "close"]].to_csv(DATA / "nq_daily.csv")
+        vx.rename(columns=str.lower)[["close"]].to_csv(DATA / "vxn_daily.csv")
     nq = _clean_ohlc(nq)
     vx = vx.rename(columns=str.lower)["close"].astype(float)
     nq["vxn"] = vx.reindex(nq.index).ffill()
@@ -188,7 +193,7 @@ def daily_forecast(D: pd.DataFrame, target: pd.Timestamp) -> float:
 # --------------------------------------------------------------------------
 # Layer 2: the 09:30-11:00 window
 # --------------------------------------------------------------------------
-def session_table(bars: pd.DataFrame, cut_m: int) -> pd.DataFrame:
+def session_table(bars: pd.DataFrame, cut_m: int, ref_m: int = M_WIN0) -> pd.DataFrame:
     b = bars.copy()
     b["sess"] = (b.index + pd.Timedelta(hours=6)).tz_localize(None).normalize()
     b["m"] = [sess_minute(t) for t in b.index.time]
@@ -204,6 +209,8 @@ def session_table(bars: pd.DataFrame, cut_m: int) -> pd.DataFrame:
         on = g[g.m < on_end]
         pre = g[(g.m >= M_PRE) & (g.m < cut_m)]
         p0 = g[g.m < M_WIN0].close
+        pr = g[g.m + 5 <= ref_m].close
+        pref = pr.iloc[-1] if len(pr) else (g.open.iloc[0] if ref_m == 0 else np.nan)
         rows[s] = {
             "n_win": len(w),
             "rv_w": w.r2.sum(),
@@ -211,6 +218,9 @@ def session_table(bars: pd.DataFrame, cut_m: int) -> pd.DataFrame:
             "rv_on": on.r2.sum(), "n_on": len(on),
             "rv_pre": pre.r2.sum(), "n_pre": len(pre),
             "px": p0.iloc[-1] if len(p0) else np.nan,
+            "pref": pref,
+            "hi": w.high.max() if len(w) else np.nan,
+            "lo": w.low.min() if len(w) else np.nan,
         }
     return pd.DataFrame.from_dict(rows, orient="index").sort_index()
 
@@ -245,8 +255,58 @@ def fit_predict(train: pd.DataFrame, x_new: pd.Series, feats: list[str], ycol: s
         "q10": float(np.exp(mu + np.quantile(resid, 0.10))),
         "q50": float(np.exp(mu + np.quantile(resid, 0.50))),
         "q90": float(np.exp(mu + np.quantile(resid, 0.90))),
+        "med": float(np.exp(mu)),
+        "loo_fit": y - resid,                      # LOO fitted values (log)
         "beta": beta, "r2": 1 - resid.var() / y.var(),
     }
+
+
+def level_forecast(train: pd.DataFrame, loo_fit: np.ndarray, w_new: float, pref: float) -> dict:
+    """Where the 09:30-11:00 range should sit, as price levels.
+
+    Point forecast: the forecast range centered on the reference price,
+    high = P*(1 + w/2) and low = P*(1 - w/2). Centering on P is the random-walk
+    (martingale) forecast. Real NQ matches a random walk closely here: the
+    reference price sits in the top or bottom 20% of the range on about half
+    of the days, same as Brownian motion. Variants that learned an up/down
+    skew from history did worse out of sample on real data, so none is used.
+
+    80% bands: for each training day, how far the high and the low landed
+    from the reference price in units of that day's leave-one-out width
+    forecast. Up and down distances are pooled (symmetric under a random
+    walk), which doubles the sample and avoids learning a trend that was
+    only in the training window.
+    """
+    w_hat = np.exp(loo_fit)
+    a_up = (train.hi.values - train.pref.values) / train.pref.values / w_hat
+    a_dn = (train.pref.values - train.lo.values) / train.pref.values / w_hat
+    a = np.r_[a_up, a_dn]
+    q10, q90 = np.quantile(a, [0.1, 0.9])
+    return {
+        "hi": pref * (1 + 0.5 * w_new), "lo": pref * (1 - 0.5 * w_new), "mid": pref,
+        "hi10": pref * (1 + q10 * w_new), "hi90": pref * (1 + q90 * w_new),
+        "lo10": pref * (1 - q90 * w_new), "lo90": pref * (1 - q10 * w_new),
+    }
+
+
+def _iou(a_lo, a_hi, b_lo, b_hi):
+    inter = np.clip(np.minimum(a_hi, b_hi) - np.maximum(a_lo, b_lo), 0, None)
+    union = np.maximum(a_hi, b_hi) - np.minimum(a_lo, b_lo)
+    return inter / union
+
+
+def dm_test(loss_a: np.ndarray, loss_b: np.ndarray) -> tuple[float, float]:
+    """Diebold-Mariano (1995): (z, two-sided p). z < 0 means a has lower loss than b.
+    Newey-West variance with 1 lag."""
+    from math import erf, sqrt
+    d = np.asarray(loss_a) - np.asarray(loss_b)
+    n = len(d)
+    dc = d - d.mean()
+    v = dc @ dc / n + 2 * 0.5 * (dc[1:] @ dc[:-1]) / n
+    if v <= 0:
+        return float("nan"), float("nan")
+    z = d.mean() / sqrt(v / n)
+    return float(z), float(2 * (1 - 0.5 * (1 + erf(abs(z) / sqrt(2)))))
 
 
 def qlike(rv, f):
@@ -307,8 +367,10 @@ def main():
     nq = load_daily(a.offline)
     D = daily_design(nq)
 
-    S = session_table(bars, cut_m)
-    hist = S[(S.index < target) & (S.n_win >= N_WIN_BARS - 1) & (S.rv_w > 0)].copy()
+    tb = bars[(bars.index + pd.Timedelta(hours=6)).tz_localize(None).normalize() == target]
+    ref_m = min(sess_minute(tb.index[-1].time()) + 5, cut_m, M_WIN0) if len(tb) else 0
+    S = session_table(bars, cut_m, ref_m)
+    hist = S[(S.index < target) & (S.n_win >= N_WIN_BARS - 1) & (S.rv_w > 0) & S.pref.notna()].copy()
     hist = hist[hist.index > D.index[30]]
     if len(hist) < MIN_TRAIN_WIN + 5:
         sys.exit(f"Only {len(hist)} complete 5-min sessions; {MIN_TRAIN_WIN + 5} are needed.")
@@ -340,14 +402,21 @@ def main():
         tr, te = hist.iloc[:k], hist.iloc[k]
         p = fit_predict(tr, te, feats, "rv_w")
         pr = fit_predict(tr, te, feats, "rng_w")
+        lv = level_forecast(tr, pr["loo_fit"], pr["med"], te.pref)
+        half22 = (tr.rng_w.iloc[-22:] * tr.px.iloc[-22:]).mean() / 2
         oos.append({
             "date": hist.index[k], "rv": te.rv_w, "rng": te.rng_w,
             "f_model": p["mean"], "f_rw": tr.rv_w.iloc[-1], "f_22": tr.rv_w.iloc[-22:].mean(),
             "r10": pr["q10"], "r90": pr["q90"], "px": te.px,
+            "pref": te.pref, "hi": te.hi, "lo": te.lo,
+            "f_hi": lv["hi"], "f_lo": lv["lo"], "f_mid": lv["mid"],
+            "hi10": lv["hi10"], "hi90": lv["hi90"], "lo10": lv["lo10"], "lo90": lv["lo90"],
+            "n_hi": te.pref + half22, "n_lo": te.pref - half22,
         })
     oos = pd.DataFrame(oos).set_index("date")
     ql = {k: qlike(oos.rv, oos[f"f_{k}"]).mean() for k in ("model", "rw", "22")}
     cover = ((oos.rng >= oos.r10) & (oos.rng <= oos.r90)).mean()
+    L = level_stats(oos)
 
     # ---- Today's forecast ----
     fr = fit_predict(hist, x_today, feats, "rv_w")
@@ -355,6 +424,8 @@ def main():
     px = today.px if (today is not None and not np.isnan(today.px)) else bars.close.iloc[-1]
     sig_pts = np.sqrt(fr["mean"]) * px
     sig5 = sig_pts / np.sqrt(N_WIN_BARS)
+    pref = today.pref if (today is not None and not np.isnan(today.pref)) else bars.close.iloc[-1]
+    lv = level_forecast(hist, fg["loo_fit"], fg["med"], pref)
     pct = (hist.rv_w < fr["mean"]).mean() * 100
     regime = ("LOW" if pct < 25 else "NORMAL" if pct < 75 else "HIGH" if pct < 90 else "VERY HIGH")
 
@@ -366,6 +437,7 @@ def main():
         "feats": "+".join(feats), "price": round(px, 2), "sigma_pts": round(sig_pts, 1),
         "rng_p10": round(fg["q10"] * px, 1), "rng_p50": round(fg["q50"] * px, 1),
         "rng_p90": round(fg["q90"] * px, 1), "regime": regime,
+        "ref_px": round(pref, 2), "f_high": round(lv["hi"], 2), "f_low": round(lv["lo"], 2),
         "real_sigma_pts": np.nan, "real_rng_pts": np.nan,
     }
     log = pd.concat([log[log["target"] != target] if len(log) else log, pd.DataFrame([row])],
@@ -376,6 +448,8 @@ def main():
             s = full.loc[r.target]
             log.at[i, "real_sigma_pts"] = round(np.sqrt(s.rv_w) * s.px, 1)
             log.at[i, "real_rng_pts"] = round(s.rng_w * s.px, 1)
+            log.at[i, "real_high"] = round(s.hi, 2)
+            log.at[i, "real_low"] = round(s.lo, 2)
     log.to_csv(LOG_PATH, index=False)
 
     # ---- Report (screen + nq_vol_data/last_run.txt) ----
@@ -393,6 +467,12 @@ def main():
     print(f" Sigma per 5-min bar          {sig5:7.1f} pts")
     print(f" Expected high-low range      {fg['q50']*px:7.1f} pts  (median)")
     print(f"   80% interval               {fg['q10']*px:7.1f} - {fg['q90']*px:.1f} pts")
+    print()
+    refm = f"{_fmt_m(ref_m)} NY" if ref_m > 0 else "last close"
+    print(f" Expected price levels 09:30-11:00  (ref {pref:,.2f} at {refm})")
+    print(f"   High    {lv['hi']:10,.2f}   80%: {lv['hi10']:,.0f} - {lv['hi90']:,.0f}")
+    print(f"   Center  {lv['mid']:10,.2f}")
+    print(f"   Low     {lv['lo']:10,.2f}   80%: {lv['lo10']:,.0f} - {lv['lo90']:,.0f}")
     if a.stop:
         print()
         print(f" Stop of {a.stop:g} pts = {a.stop/sig5:.1f} sigmas of a 5-min bar; "
@@ -408,6 +488,20 @@ def main():
     print(f"   model {ql['model']:.3f} | yesterday's window {ql['rw']:.3f} | 22-day average {ql['22']:.3f}")
     print(f"   improvement vs 22-day average: {(1-ql['model']/ql['22'])*100:+.0f}%   "
           f"10-90 range coverage: {cover*100:.0f}% (target 80%)")
+    print()
+    print(f" Level backtest ({L['n']} days, out of sample, points):")
+    print(f"   MAE high {L['mae_hi']:.0f} | low {L['mae_lo']:.0f} | center {L['mae_mid']:.0f}"
+          f"   (naive +/- half 22d range: {L['n_mae_hi']:.0f} | {L['n_mae_lo']:.0f})")
+    print(f"   high within 25/50 pts: {L['hi25']*100:.0f}% / {L['hi50']*100:.0f}%   "
+          f"low within 25/50 pts: {L['lo25']*100:.0f}% / {L['lo50']*100:.0f}%")
+    print(f"   overlap forecast vs actual range (IoU): {L['iou']*100:.0f}%   "
+          f"80% bands hold high {L['cov_hi']*100:.0f}% / low {L['cov_lo']*100:.0f}%")
+    z, pz = L["dm"]
+    verdict = "better" if z < 0 else "worse"
+    print(f"   vs naive: {verdict} (Diebold-Mariano z={z:+.2f}, p={pz:.2f})")
+    print(f"   direction floor: a PERFECT width forecast centered on the ref price still misses by "
+          f"{L['oracle']:.0f} pts")
+    print(f"   |actual center - ref| / range = {L['c_ratio']:.2f}  (random walk: 0.29)")
     done = log.dropna(subset=["real_rng_pts"]).tail(5)
     if len(done):
         print()
@@ -421,7 +515,27 @@ def main():
     out.close()
 
     if not a.no_plot:
-        _plot(oos, target, fg, px)
+        _plot(oos, target, fg, px, lv, pref)
+
+
+def level_stats(o: pd.DataFrame) -> dict:
+    eh, el = (o.f_hi - o.hi).abs(), (o.f_lo - o.lo).abs()
+    nh, nl = (o.n_hi - o.hi).abs(), (o.n_lo - o.lo).abs()
+    return {
+        "n": len(o),
+        "mae_hi": eh.mean(), "mae_lo": el.mean(),
+        "mae_mid": (o.f_mid - (o.hi + o.lo) / 2).abs().mean(),
+        "n_mae_hi": nh.mean(), "n_mae_lo": nl.mean(),
+        "hi25": (eh <= 25).mean(), "hi50": (eh <= 50).mean(),
+        "lo25": (el <= 25).mean(), "lo50": (el <= 50).mean(),
+        "iou": _iou(o.f_lo, o.f_hi, o.lo, o.hi).mean(),
+        "cov_hi": ((o.hi >= o.hi10) & (o.hi <= o.hi90)).mean(),
+        "cov_lo": ((o.lo >= o.lo10) & (o.lo <= o.lo90)).mean(),
+        "dm": dm_test((eh + el).values, (nh + nl).values),
+        # a perfect width forecast, centered on the reference price: what is left is direction
+        "oracle": (((o.pref + (o.hi - o.lo) / 2 - o.hi).abs() + (o.pref - (o.hi - o.lo) / 2 - o.lo).abs()) / 2).mean(),
+        "c_ratio": ((o.hi + o.lo) / 2 - o.pref).abs().mean() / (o.hi - o.lo).mean(),
+    }
 
 
 def _fmt_m(m: int) -> str:
@@ -429,27 +543,54 @@ def _fmt_m(m: int) -> str:
     return f"{h:02d}:{mm:02d}"
 
 
-def _plot(oos, target, fg, px):
-    """Show the chart in a window. Nothing is saved to disk."""
+def _plot(oos, target, fg, px, lv, pref):
+    """Show the chart in a window. Nothing is saved to disk.
+
+    Top: width of the range (forecast band vs actual).
+    Bottom: where the range sat, in points from the reference price.
+    """
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         return
-    fig, ax = plt.subplots(figsize=(10, 4.2))
+    fig, (ax, ax2) = plt.subplots(2, 1, figsize=(10, 7.5), sharex=True,
+                                  gridspec_kw={"height_ratios": [1, 1.25]})
     try:
         fig.canvas.manager.set_window_title(f"NQ vol 09:30-11:00  |  {target:%d %b %Y}")
     except Exception:
         pass
+
     ax.fill_between(oos.index, oos.r10 * oos.px, oos.r90 * oos.px, alpha=0.25,
                     label="10-90 forecast (out of sample)")
-    ax.plot(oos.index, oos.rng * oos.px, "o-", ms=3, lw=1, label="actual 09:30-11:00 range")
+    ax.plot(oos.index, oos.rng * oos.px, "o-", ms=3, lw=1, label="actual range")
     ax.errorbar([target], [fg["q50"] * px],
                 yerr=[[fg["q50"] * px - fg["q10"] * px], [fg["q90"] * px - fg["q50"] * px]],
                 fmt="s", color="crimson", capsize=4, label="next session")
-    ax.set_ylabel("NQ points")
-    ax.set_title("NQ 09:30-11:00 range: forecast vs actual")
+    ax.set_ylabel("range width (pts)")
+    ax.set_title("NQ 09:30-11:00: how big (top) and where (bottom)")
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(alpha=0.3)
+
+    rel = lambda col: oos[col] - oos.pref
+    ax2.fill_between(oos.index, rel("hi10"), rel("hi90"), color="tab:green", alpha=0.15, label="high 80% band")
+    ax2.fill_between(oos.index, rel("lo10"), rel("lo90"), color="tab:red", alpha=0.15, label="low 80% band")
+    ax2.vlines(oos.index, rel("lo"), rel("hi"), color="0.35", lw=3, alpha=0.6, label="actual range")
+    ax2.plot(oos.index, rel("f_hi"), "_", color="tab:green", ms=12, mew=2, label="forecast high")
+    ax2.plot(oos.index, rel("f_lo"), "_", color="tab:red", ms=12, mew=2, label="forecast low")
+    ax2.plot(oos.index, rel("f_mid"), ".", color="k", ms=4, label="forecast center")
+    ax2.axhline(0, color="k", lw=0.8)
+    t = target
+    for key, lo_k, hi_k, c in (("hi", "hi10", "hi90", "tab:green"), ("lo", "lo10", "lo90", "tab:red")):
+        ax2.errorbar([t], [lv[key] - pref], yerr=[[lv[key] - lv[lo_k]], [lv[hi_k] - lv[key]]],
+                     fmt="s", color=c, capsize=4)
+        ax2.annotate(f"{lv[key]:,.0f}", (t, lv[key] - pref), textcoords="offset points",
+                     xytext=(8, -3), fontsize=8, color=c)
+    ax2.plot([t], [lv["mid"] - pref], "D", color="k", ms=4)
+    ax2.annotate(f"{lv['mid']:,.0f}", (t, lv["mid"] - pref), textcoords="offset points",
+                 xytext=(8, -3), fontsize=8)
+    ax2.set_ylabel(f"points from ref price (next: {pref:,.0f})")
+    ax2.legend(loc="upper left", fontsize=7, ncol=3)
+    ax2.grid(alpha=0.3)
     fig.autofmt_xdate()
     fig.tight_layout()
     print(" (close the chart window to finish)")
