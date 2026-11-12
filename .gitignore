@@ -1,0 +1,10 @@
+# Local data: 5-min cache, forecast log, last run output
+nq_vol_data/
+
+# Personal run arguments (e.g. --stop), read by run_nq_vol.bat
+local_args.txt
+
+__pycache__/
+*.pyc
+*.png
+.venv/
