@@ -60,11 +60,11 @@ The same data replayed as a 09:20 run, with the overnight and premarket terms (2
 
 | | Width (QLIKE) | High, MAE pts | Low, MAE pts |
 |---|---|---|---|
-| This model | **0.153** | 111 | 137 |
+| This model | **0.153** | 111 | 136 |
 | Yesterday's window | 0.365 | | |
 | 22-day average / naive levels (P ± half the 22-day mean range) | 0.419 | 118 | 122 |
 
-The premarket information cuts the width loss by 63% against the 22-day average, and the window layer explains 61% of the day-to-day variation (leave-one-out R²). The levels are a different story. The high lands within 50 points of the forecast on 33% of days and the low on 33%, the forecast and actual ranges overlap by 53% on average, and the 80% bands held the high on 67% of days and the low on 83%. Against the naive levels the model is slightly worse on these 24 days (Diebold-Mariano z = +2.61). The naive band was wider during the high-volatility weeks after 5 Nov, because its 22-day mean still included that 1,496-point session, and the realized ranges in that stretch ran wide.
+The premarket information cuts the width loss by 63% against the 22-day average, and the window layer explains 61% of the day-to-day variation (leave-one-out R²). The levels are a different story. The high lands within 50 points of the forecast on 33% of days and the low on 33%, the forecast and actual ranges overlap by 53% on average, and the 80% bands held the high on 67% of days and the low on 83%. Against the naive levels the model is slightly worse on these 24 days (Diebold-Mariano z = +2.67). The naive band was wider during the high-volatility weeks after 5 Nov, because its 22-day mean still included that 1,496-point session, and the realized ranges in that stretch ran wide.
 
 Before touching real data the model was checked on synthetic NQ (`synthetic/make_synth.py`), which simulates HAR volatility, the intraday U shape, spikes at 08:30 and 09:30, event-day shocks, overnight shocks and fat-tailed returns. Over seven seeds with 60 days of 5-minute data the model beat the 22-day average in QLIKE on six and kept interval coverage between 71% and 85%. With 120 days the level forecast beat the naive levels on all three seeds tested (Diebold-Mariano p between 0.00 and 0.02), and the center error stayed at the random-walk floor, as it should when the true process has no direction. Testing on synthetic data first also found two real bugs: Monday's session opens on Sunday at 18:00, and CSV timestamps break when a file crosses a daylight-saving change.
 
@@ -106,7 +106,7 @@ The model has no event calendar. Releases at 10:00 (ISM, JOLTS, consumer sentime
 
 The window layer is fitted on whatever 5-minute history exists. With the Yahoo limit that starts at about 60 days, which makes the interval noisy. The `--csv5m` option exists to load longer history from a data vendor.
 
-Yahoo futures data is delayed by about 10 minutes, so a run at 09:20 sees premarket data up to around 09:10. The backtest is built with the same cutoff as the live run, so the evaluation is consistent with what the model sees in practice.
+Yahoo futures data is delayed by about 10 minutes, so a run at 09:20 sees premarket data up to around 09:10. The script detects where today's data really ends and cuts every past session at that same minute, for the premarket feature, the reference price and the backtest, so the evaluation matches what the model sees live.
 
 Half-day sessions are dropped from the history because the window is incomplete, but the script does not know the exchange calendar and will still produce a forecast for a holiday.
 

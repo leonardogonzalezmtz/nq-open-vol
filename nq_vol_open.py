@@ -261,11 +261,13 @@ def fit_predict(train: pd.DataFrame, x_new: pd.Series, feats: list[str], ycol: s
     }
 
 
-def level_forecast(train: pd.DataFrame, loo_fit: np.ndarray, w_new: float, pref: float) -> dict:
+def level_forecast(train: pd.DataFrame, loo_fit: np.ndarray, w_band: float, w_point: float,
+                   pref: float) -> dict:
     """Where the 09:30-11:00 range should sit, as price levels.
 
-    Point forecast: the forecast range centered on the reference price,
-    high = P*(1 + w/2) and low = P*(1 - w/2). Centering on P is the random-walk
+    Point forecast: the median forecast range w_point centered on the reference
+    price, high = P*(1 + w/2) and low = P*(1 - w/2), so High - Low equals the
+    range that is printed. Centering on P is the random-walk
     (martingale) forecast. Real NQ matches a random walk closely here: the
     reference price sits in the top or bottom 20% of the range on about half
     of the days, same as Brownian motion. Variants that learned an up/down
@@ -273,7 +275,8 @@ def level_forecast(train: pd.DataFrame, loo_fit: np.ndarray, w_new: float, pref:
 
     80% bands: for each training day, how far the high and the low landed
     from the reference price in units of that day's leave-one-out width
-    forecast. Up and down distances are pooled (symmetric under a random
+    forecast (w_band = exp of the fitted log width, the same scale as those
+    LOO fits). Up and down distances are pooled (symmetric under a random
     walk), which doubles the sample and avoids learning a trend that was
     only in the training window.
     """
@@ -283,9 +286,9 @@ def level_forecast(train: pd.DataFrame, loo_fit: np.ndarray, w_new: float, pref:
     a = np.r_[a_up, a_dn]
     q10, q90 = np.quantile(a, [0.1, 0.9])
     return {
-        "hi": pref * (1 + 0.5 * w_new), "lo": pref * (1 - 0.5 * w_new), "mid": pref,
-        "hi10": pref * (1 + q10 * w_new), "hi90": pref * (1 + q90 * w_new),
-        "lo10": pref * (1 - q90 * w_new), "lo90": pref * (1 - q10 * w_new),
+        "hi": pref * (1 + 0.5 * w_point), "lo": pref * (1 - 0.5 * w_point), "mid": pref,
+        "hi10": pref * (1 + q10 * w_band), "hi90": pref * (1 + q90 * w_band),
+        "lo10": pref * (1 - q90 * w_band), "lo90": pref * (1 - q10 * w_band),
     }
 
 
@@ -367,8 +370,13 @@ def main():
     nq = load_daily(a.offline)
     D = daily_design(nq)
 
+    # Yahoo bars arrive ~10 min late, so today's data ends before the clock does.
+    # The features and the reference price use the minute where today's data
+    # really ends, and every past session is cut at that same minute.
     tb = bars[(bars.index + pd.Timedelta(hours=6)).tz_localize(None).normalize() == target]
     ref_m = min(sess_minute(tb.index[-1].time()) + 5, cut_m, M_WIN0) if len(tb) else 0
+    if len(tb):
+        cut_m = ref_m
     S = session_table(bars, cut_m, ref_m)
     hist = S[(S.index < target) & (S.n_win >= N_WIN_BARS - 1) & (S.rv_w > 0) & S.pref.notna()].copy()
     hist = hist[hist.index > D.index[30]]
@@ -402,7 +410,7 @@ def main():
         tr, te = hist.iloc[:k], hist.iloc[k]
         p = fit_predict(tr, te, feats, "rv_w")
         pr = fit_predict(tr, te, feats, "rng_w")
-        lv = level_forecast(tr, pr["loo_fit"], pr["med"], te.pref)
+        lv = level_forecast(tr, pr["loo_fit"], pr["med"], pr["q50"] * te.px / te.pref, te.pref)
         half22 = (tr.rng_w.iloc[-22:] * tr.px.iloc[-22:]).mean() / 2
         oos.append({
             "date": hist.index[k], "rv": te.rv_w, "rng": te.rng_w,
@@ -425,7 +433,7 @@ def main():
     sig_pts = np.sqrt(fr["mean"]) * px
     sig5 = sig_pts / np.sqrt(N_WIN_BARS)
     pref = today.pref if (today is not None and not np.isnan(today.pref)) else bars.close.iloc[-1]
-    lv = level_forecast(hist, fg["loo_fit"], fg["med"], pref)
+    lv = level_forecast(hist, fg["loo_fit"], fg["med"], fg["q50"] * px / pref, pref)
     pct = (hist.rv_w < fr["mean"]).mean() * 100
     regime = ("LOW" if pct < 25 else "NORMAL" if pct < 75 else "HIGH" if pct < 90 else "VERY HIGH")
 
@@ -460,7 +468,7 @@ def main():
     print(f" NQ  |  Expected volatility 09:30-11:00 NY  |  {target:%a %d %b %Y}")
     print(bar)
     upto = f"{_fmt_m(cut_m)} NY" if cut_m > 0 else "no bars from this session yet"
-    print(f" Run: {now:%a %H:%M} NY   data up to: {upto}   ref price: {px:,.2f}")
+    print(f" Run: {now:%a %H:%M} NY   data up to: {upto}   last price: {px:,.2f}")
     print(f" Regime: {regime}  (percentile {pct:.0f} of the last {len(hist)} days)")
     print()
     print(f" Window sigma                 {sig_pts:7.1f} pts   ({np.sqrt(fr['mean'])*100:.2f}%)")
